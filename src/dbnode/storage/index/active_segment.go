@@ -21,17 +21,57 @@
 package index
 
 import (
-	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
+	"time"
+
+	m3ninxindex "github.com/m3db/m3/src/m3ninx/index"
 	"github.com/m3db/m3/src/m3ninx/index/segment"
-	"github.com/m3db/m3/src/m3ninx/index/segment/mem"
 )
 
-// NewBootstrapResultMutableSegmentAllocator returns a default mutable segment
-// allocator for a bootstrap result index block given index options.
-func NewBootstrapResultMutableSegmentAllocator(
-	opts Options,
-) result.MutableSegmentAllocator {
-	return func() (segment.MutableSegment, error) {
-		return mem.NewSegment(0, opts.MemSegmentOptions()), nil
+type activeSegmentState byte
+
+const (
+	mutableActiveSegmentState activeSegmentState = iota
+	fstActiveSegmentState
+)
+
+func (a activeSegmentState) String() string {
+	switch a {
+	case mutableActiveSegmentState:
+		return "mutableActiveSegment"
+	case fstActiveSegmentState:
+		return "fstActiveSegment"
 	}
+	return "unknownActiveSegment"
+}
+
+// activeSegment starts out backed by a mutable segment, which is rotated
+// to a FST segment based on size constraints.
+type activeSegment struct {
+	creationTime   time.Time
+	state          activeSegmentState
+	mutableSegment segment.MutableSegment
+	fstSegment     segment.Segment
+}
+
+func (a *activeSegment) Reader() (m3ninxindex.Reader, error) {
+	if a.state == fstActiveSegmentState {
+		return a.fstSegment.Reader()
+	}
+	return a.mutableSegment.Reader()
+}
+
+func (a *activeSegment) Size() int64 {
+	if a.state == fstActiveSegmentState {
+		return a.fstSegment.Size()
+	}
+	return a.mutableSegment.Size()
+}
+
+func (a *activeSegment) Close() error {
+	if a.state == mutableActiveSegmentState {
+		return a.mutableSegment.Close()
+	}
+
+	// TODO(prateek): handle rotatingActiveSegmentState
+	return a.fstSegment.Close()
 }

@@ -29,6 +29,7 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
 	"github.com/m3db/m3/src/m3ninx/doc"
 	"github.com/m3db/m3/src/m3ninx/idx"
+	"github.com/m3db/m3/src/m3ninx/index/segment/fst"
 	"github.com/m3db/m3/src/m3ninx/index/segment/mem"
 	"github.com/m3db/m3x/context"
 	"github.com/m3db/m3x/ident"
@@ -164,26 +165,26 @@ type Block interface {
 	// soon as it can be to reduce memory footprint.
 	NeedsMutableSegmentsEvicted() bool
 
-	// EvictMutableSegments closes any mutable segments, this is only applicable
+	// EvictActiveSegments closes any active segments, this is only applicable
 	// valid to be called once the block and hence mutable segments are sealed.
 	// It is expected that results have been added to the block that covers any
 	// data the mutable segments should have held at this time.
-	EvictMutableSegments() (EvictMutableSegmentResults, error)
+	EvictActiveSegments() (EvictActiveSegmentResults, error)
 
 	// Close will release any held resources and close the Block.
 	Close() error
 }
 
-// EvictMutableSegmentResults returns statistics about the EvictMutableSegments execution.
-type EvictMutableSegmentResults struct {
-	NumMutableSegments int64
-	NumDocs            int64
+// EvictActiveSegmentResults returns statistics about the EvictActiveSegments execution.
+type EvictActiveSegmentResults struct {
+	NumActiveSegments int64
+	NumDocs           int64
 }
 
 // Add adds the provided results to the receiver.
-func (e *EvictMutableSegmentResults) Add(o EvictMutableSegmentResults) {
+func (e *EvictActiveSegmentResults) Add(o EvictActiveSegmentResults) {
 	e.NumDocs += o.NumDocs
-	e.NumMutableSegments += o.NumMutableSegments
+	e.NumActiveSegments += o.NumActiveSegments
 }
 
 // WriteBatchResult returns statistics about the WriteBatch execution.
@@ -528,6 +529,12 @@ type Options interface {
 
 	// InstrumentOptions returns the instrument options.
 	InstrumentOptions() instrument.Options
+
+	// SetFSTSegmentOptions sets the fst segment options.
+	SetFSTSegmentOptions(value fst.Options) Options
+
+	// FSTSegmentOptions returns the fst segment options.
+	FSTSegmentOptions() fst.Options
 
 	// SetMemSegmentOptions sets the mem segment options.
 	SetMemSegmentOptions(value mem.Options) Options
