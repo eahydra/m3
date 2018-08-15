@@ -52,6 +52,7 @@ type opts struct {
 	idPool         ident.Pool
 	bytesPool      pool.CheckedBytesPool
 	resultsPool    ResultsPool
+	compactOpts    CompactionOptions
 }
 
 var undefinedUUIDFn = func() ([]byte, error) { return nil, errIDGenerationDisabled }
@@ -78,6 +79,7 @@ func NewOptions() Options {
 		fstOpts:        fstOpts,
 		idPool:         idPool,
 		resultsPool:    resultsPool,
+		compactOpts:    NewCompactionOptions(),
 	}
 	resultsPool.Init(func() Results { return NewResults(opts) })
 	return opts
@@ -176,4 +178,14 @@ func (o *opts) SetResultsPool(value ResultsPool) Options {
 
 func (o *opts) ResultsPool() ResultsPool {
 	return o.resultsPool
+}
+
+func (o *opts) SetCompactionOptions(value CompactionOptions) Options {
+	opts := *o
+	opts.compactOpts = value
+	return &opts
+}
+
+func (o *opts) CompactionOptions() CompactionOptions {
+	return o.compactOpts
 }

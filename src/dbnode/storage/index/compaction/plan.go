@@ -36,21 +36,13 @@ var (
 )
 
 var (
-	DefaultSizeBuckets = []SizeBucket{ // i.e. tiers for compaction [0, 262K), [262K, 524K), [524K, 1M), [1M, 2M), [2M, 8M)
+	DefaultSizeBuckets = []SizeBucket{ // i.e. tiers for compaction [0, 524K), [524K, 2M), [2M, 8M)
 		SizeBucket{
 			MinSizeInclusive: 0,
-			MaxSizeExclusive: 1 << 18,
-		},
-		SizeBucket{
-			MinSizeInclusive: 1 << 18,
 			MaxSizeExclusive: 1 << 19,
 		},
 		SizeBucket{
 			MinSizeInclusive: 1 << 19,
-			MaxSizeExclusive: 1 << 20,
-		},
-		SizeBucket{
-			MinSizeInclusive: 1 << 20,
 			MaxSizeExclusive: 1 << 21,
 		},
 		SizeBucket{
@@ -60,7 +52,7 @@ var (
 	}
 
 	DefaultOptions = PlannerOptions{
-		MaxImmutableCompactionSize: 1 << 22,                            // ~4M
+		MaxImmutableCompactionSize: 1 << 21,                            // ~2M
 		MaxMutableSegmentSize:      1 << 16,                            // 64K
 		MutableCompactionAge:       15 * time.Second,                   // any mutable segment 15s or older is eligible for compactions
 		SizeBuckets:                DefaultSizeBuckets,                 // sizes defined above

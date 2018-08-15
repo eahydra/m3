@@ -24,11 +24,14 @@ import (
 	goctx "context"
 	"errors"
 	"fmt"
-	"sort"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/m3db/m3/src/dbnode/clock"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
+	"github.com/m3db/m3/src/dbnode/storage/index/compaction"
+	"github.com/m3db/m3/src/dbnode/storage/index/segments"
 	"github.com/m3db/m3/src/dbnode/storage/namespace"
 	m3ninxindex "github.com/m3db/m3/src/m3ninx/index"
 	"github.com/m3db/m3/src/m3ninx/index/segment"
@@ -58,12 +61,6 @@ var (
 	errUnableToWriteBlockUnknownStateFmtString = "unable to write, unknown index block state: %v"
 )
 
-const (
-	defaultMutableSegmentRotationSize      = 1 << 16 // TODO(prateek): migrate to options
-	defaultMutableSegmentRotationMergeSize = 1 << 20 // TODO(prateek): migrate to options
-	defaultMutableSegmentRotationAge       = 30 * time.Second
-)
-
 type blockState byte
 
 const (
@@ -72,35 +69,32 @@ const (
 	blockStateSealed
 )
 
-type newExecutorFn func() (search.Executor, error)
+type doneFn func()
+
+type newExecutorFn func() (search.Executor, doneFn, error)
 
 type block struct {
 	sync.RWMutex
 	state               blockState
-	shardRangesSegments []blockShardRangesSegments
+	shardRangesSegments []*blockShardRangesSegments
 	activeSegments      []*activeSegment
-	segmentID           atomic.Int64
 
-	// the following are used to help activeSegment rotations from map->fst Segments
-	rotateCh         chan struct{}
-	closeCtx         goctx.Context
-	closeCtxCancelFn goctx.CancelFunc
+	// the following are used to help compactions
+	numActiveCompactions *atomic.Int64
+	compactOpts          CompactionOptions
+	rotateCh             chan struct{}
+	closeCtx             goctx.Context
+	closeCtxCancelFn     goctx.CancelFunc
 
+	nowFn         clock.NowFn
 	metrics       blockMetrics
+	segmentID     atomic.Int64
 	newExecutorFn newExecutorFn
 	startTime     time.Time
 	endTime       time.Time
 	blockSize     time.Duration
 	opts          Options
 	nsMD          namespace.Metadata
-}
-
-// blockShardsSegments is a collection of segments that has a mapping of what shards
-// and time ranges they completely cover, this can only ever come from computing
-// from data that has come from shards, either on an index flush or a bootstrap.
-type blockShardRangesSegments struct {
-	shardTimeRanges result.ShardTimeRanges
-	segments        []segment.Segment
 }
 
 // NewBlock returns a new Block, representing a complete reverse index for the
@@ -116,21 +110,25 @@ func NewBlock(
 
 	closeCtx, closeFn := goctx.WithCancel(goctx.Background())
 	b := &block{
-		state:            blockStateOpen,
-		rotateCh:         make(chan struct{}, 1),
-		closeCtx:         closeCtx,
-		closeCtxCancelFn: closeFn,
-		metrics:          newBlockMetrics(opts.InstrumentOptions().MetricsScope()),
-		startTime:        startTime,
-		endTime:          startTime.Add(blockSize),
-		blockSize:        blockSize,
-		opts:             opts,
-		nsMD:             md,
+		state: blockStateOpen,
+
+		numActiveCompactions: atomic.NewInt64(0),
+		compactOpts:          opts.CompactionOptions(),
+		rotateCh:             make(chan struct{}, 1),
+		closeCtx:             closeCtx,
+		closeCtxCancelFn:     closeFn,
+
+		metrics:   newBlockMetrics(opts.InstrumentOptions()),
+		nowFn:     opts.ClockOptions().NowFn(),
+		startTime: startTime,
+		endTime:   startTime.Add(blockSize),
+		blockSize: blockSize,
+		opts:      opts,
+		nsMD:      md,
 	}
 	b.newExecutorFn = b.executorWithRLock
 	b.addActiveSegmentWithLock()
 	go b.monitorRotations()
-	go b.reportMetrics()
 	return b, nil
 }
 
@@ -167,13 +165,18 @@ func (b *block) WriteBatch(inserts *WriteBatch) (WriteBatchResult, error) {
 	}
 
 	defer func() {
-		if mutableSeg.Size() > defaultMutableSegmentRotationSize ||
-			time.Since(mutableActiveSeg.creationTime) > defaultMutableSegmentRotationAge {
-			mutableSeg.Seal() // TODO(prateek) error?
+		if mutableActiveSeg.MutableAndCompactable(b.compactOpts.PlannerOptions()) {
+			mutableActiveSeg.writable = false
+			mutableSeg.Seal()
 			b.addActiveSegmentWithLock()
 			b.triggerRotations()
 		}
 	}()
+
+	earliestWrite, ok := inserts.PendingEntries().EarliestEnqueuedAt()
+	if ok {
+		mutableActiveSeg.UpdateEarliestWrite(earliestWrite)
+	}
 
 	err := mutableSeg.InsertBatch(m3ninxindex.Batch{
 		Docs:                inserts.PendingDocs(),
@@ -208,16 +211,27 @@ func (b *block) WriteBatch(inserts *WriteBatch) (WriteBatchResult, error) {
 	}, partialErr
 }
 
-func (b *block) executorWithRLock() (search.Executor, error) {
+func (b *block) executorWithRLock() (search.Executor, doneFn, error) {
 	expectedReaders := len(b.activeSegments)
 	for _, group := range b.shardRangesSegments {
 		expectedReaders += len(group.segments)
 	}
 
 	var (
-		readers = make([]m3ninxindex.Reader, 0, expectedReaders)
-		success = false
+		activeSegs    = make([]*activeSegment, 0, expectedReaders)
+		nonActiveSegs = make([]*blockShardRangesSegments, 0, expectedReaders)
+		readers       = make([]m3ninxindex.Reader, 0, expectedReaders)
+		success       = false
 	)
+
+	done := func() {
+		for _, seg := range activeSegs {
+			seg.ReaderDone()
+		}
+		for _, group := range nonActiveSegs {
+			group.readsWg.Done()
+		}
+	}
 
 	// cleanup in case any of the readers below fail.
 	defer func() {
@@ -230,14 +244,15 @@ func (b *block) executorWithRLock() (search.Executor, error) {
 
 	// start with the segment that's being actively written to (if we have one)
 	for _, seg := range b.activeSegments {
-		if seg.state != fstActiveSegmentState {
+		if seg.segmentType != segments.FSTType {
 			continue
 		}
 		reader, err := seg.Reader()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		readers = append(readers, reader)
+		activeSegs = append(activeSegs, seg)
 	}
 
 	// loop over the segments associated to shard time ranges
@@ -245,14 +260,16 @@ func (b *block) executorWithRLock() (search.Executor, error) {
 		for _, seg := range group.segments {
 			reader, err := seg.Reader()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
+			group.readsWg.Add(1)
 			readers = append(readers, reader)
+			nonActiveSegs = append(nonActiveSegs, group)
 		}
 	}
 
 	success = true
-	return executor.NewExecutor(readers), nil
+	return executor.NewExecutor(readers), done, nil
 }
 
 func (b *block) Query(
@@ -261,15 +278,17 @@ func (b *block) Query(
 	results Results,
 ) (bool, error) {
 	b.RLock()
-	defer b.RUnlock()
 	if b.state == blockStateClosed {
+		b.RUnlock()
 		return false, errUnableToQueryBlockClosed
 	}
 
-	exec, err := b.newExecutorFn()
+	exec, done, err := b.newExecutorFn()
+	b.RUnlock()
 	if err != nil {
 		return false, err
 	}
+	defer done()
 
 	// FOLLOWUP(prateek): push down QueryOptions to restrict results
 	// TODO(jeromefroe): Use the idx query directly once we implement an index in m3ninx
@@ -362,7 +381,7 @@ func (b *block) AddResults(
 		}
 	}
 
-	entry := blockShardRangesSegments{
+	entry := &blockShardRangesSegments{
 		shardTimeRanges: results.Fulfilled(),
 		segments:        results.Segments(),
 	}
@@ -386,11 +405,8 @@ func (b *block) AddResults(
 	// This is the case where the new segments can wholly replace the
 	// current set of blocks since unfullfilled by the new segments is zero
 	for i, group := range b.shardRangesSegments {
-		for _, seg := range group.segments {
-			// Make sure to close the existing segments
-			multiErr = multiErr.Add(seg.Close())
-		}
-		b.shardRangesSegments[i] = blockShardRangesSegments{}
+		group.Close()
+		b.shardRangesSegments[i] = nil
 	}
 	b.shardRangesSegments = append(b.shardRangesSegments[:0], entry)
 
@@ -405,13 +421,13 @@ func (b *block) Tick(c context.Cancellable, tickStart time.Time) (BlockTickResul
 		return result, errUnableToTickBlockClosed
 	}
 
-	// active segment, can be nil incase we've evicted it already.
+	// active segments
 	for _, seg := range b.activeSegments {
 		result.NumSegments++
 		result.NumDocs += seg.Size()
 	}
 
-	// any other segments
+	// all other segments (bootstrapped/etc)
 	for _, group := range b.shardRangesSegments {
 		for _, seg := range group.segments {
 			result.NumSegments++
@@ -433,14 +449,16 @@ func (b *block) Seal() error {
 	b.state = blockStateSealed
 
 	var multiErr xerrors.MultiError
+	// TODO(prateek): stop all on-going compactions, and force-compact all the segments below into a single segment
 	// seal active mutable segments.
 	for _, seg := range b.activeSegments {
-		if seg.state == mutableActiveSegmentState {
+		if seg.segmentType == segments.MutableType {
 			_, err := seg.mutableSegment.Seal()
 			multiErr = multiErr.Add(err)
 		}
 	}
 
+	// TODO(prateek): ensure that all segments from flush/bootstrap are FST already and delete this code
 	// loop over any added mutable segments and seal them too.
 	for _, group := range b.shardRangesSegments {
 		for _, seg := range group.segments {
@@ -504,26 +522,11 @@ func (b *block) EvictActiveSegments() (EvictActiveSegmentResults, error) {
 	for _, seg := range b.activeSegments {
 		results.NumActiveSegments++
 		results.NumDocs += seg.Size()
+		multiErr = multiErr.Add(seg.Seal())
 		multiErr = multiErr.Add(seg.Close())
 	}
 	// clear any references to active segments
 	b.activeSegments = nil
-
-	// close any other mutable segments too.
-	for idx := range b.shardRangesSegments {
-		segments := make([]segment.Segment, 0, len(b.shardRangesSegments[idx].segments))
-		for _, seg := range b.shardRangesSegments[idx].segments {
-			mutableSeg, ok := seg.(segment.MutableSegment)
-			if !ok {
-				segments = append(segments, seg)
-				continue
-			}
-			results.NumActiveSegments++
-			results.NumDocs += mutableSeg.Size()
-			multiErr = multiErr.Add(mutableSeg.Close())
-		}
-		b.shardRangesSegments[idx].segments = segments
-	}
 
 	return results, multiErr.FinalError()
 }
@@ -543,15 +546,14 @@ func (b *block) Close() error {
 
 	// close any active segments.
 	for _, seg := range b.activeSegments {
+		multiErr = multiErr.Add(seg.Seal())
 		multiErr = multiErr.Add(seg.Close())
 	}
 	b.activeSegments = nil
 
 	// close any other added segments too.
 	for _, group := range b.shardRangesSegments {
-		for _, seg := range group.segments {
-			multiErr = multiErr.Add(seg.Close())
-		}
+		group.Close()
 	}
 	b.shardRangesSegments = nil
 
@@ -572,63 +574,83 @@ func (b *block) monitorRotations() {
 		case <-b.closeCtx.Done():
 			return
 		case <-b.rotateCh:
-			b.rotateMutableActiveSegments()
+			b.coordinateCompactions()
 		}
 	}
 }
 
-func (b *block) rotateMutableActiveSegments() {
+func (b *block) coordinateCompactions() {
 	// find group of active segments which need to be rotated
-	var (
-		activeSegmentsToRotate                   []*activeSegment
-		segmentsToRotate                         []segment.Segment
-		accumulatedSize                          int64
-		numAccumulatedMutable, numAccumulatedFST int
-	)
 	b.Lock()
-	// NB: sort the segments into ascending order by size, to guarantee we merge as many as we can
-	sort.Slice(b.activeSegments, func(i, j int) bool {
-		return b.activeSegments[i].Size() < b.activeSegments[j].Size()
-	})
-	for _, seg := range b.activeSegments {
-		size := seg.Size()
-		// if adding this segment is going to overflow the size, don't add it, and terminate the loop
-		// because we know there are no smaller segments to be added (due to the sort above).
-		if accumulatedSize+size >= defaultMutableSegmentRotationMergeSize {
-			break
-		}
-		if seg.state == mutableActiveSegmentState && seg.mutableSegment.IsSealed() {
-			seg.state = rotatingActiveSegmentState // mark the segment as being rotated
-			accumulatedSize += size
-			segmentsToRotate = append(segmentsToRotate, seg.mutableSegment)
-			activeSegmentsToRotate = append(activeSegmentsToRotate, seg)
-			numAccumulatedMutable++
-		} else if seg.state == fstActiveSegmentState {
-			accumulatedSize += size
-			segmentsToRotate = append(segmentsToRotate, seg.fstSegment)
-			activeSegmentsToRotate = append(activeSegmentsToRotate, seg)
-			numAccumulatedFST++
-		}
-	}
-	b.Unlock()
-
-	// i.e. no active segments need rotation, so we can terminate early
-	if len(segmentsToRotate) == 0 || (len(segmentsToRotate) == 1 && numAccumulatedMutable == 0) {
+	candidates := b.newCompactionCandidatesWithRLock()
+	compactionPlan, err := compaction.NewPlan(candidates, b.compactOpts.PlannerOptions())
+	if err != nil {
+		b.opts.InstrumentOptions().Logger().Errorf("unable to create compaction plan, err = %v", err)
+		b.Unlock()
 		return
 	}
+	// can early terminate if we don't need to do any work.
+	if len(compactionPlan.Tasks) == 0 {
+		b.Unlock()
+		return
+	}
+	// mark all segments about to be compacted as such to avoid double-compacting
+	b.setCompactingStatusWithLock(true, compactionPlan.Tasks)
+	b.Unlock()
 
-	start := time.Now()
-	// merge segments to rotate
+	// at long last, actually compact the segments
+	workers := b.compactOpts.WorkerPool()
+	for idx := range compactionPlan.Tasks {
+		task := compactionPlan.Tasks[idx]
+		workers.Go(func() { b.compactAndSwapSegments(task) })
+	}
+}
+
+func (b *block) setCompactingStatusWithLock(compacting bool, tasks []compaction.Task) {
+	// mark segments w/ appropriate compacting status in activeSegments
+	for _, seg := range b.activeSegments {
+		candidateSegment := seg.Segment()
+		for _, task := range tasks {
+			for _, taskSeg := range task.Segments {
+				if candidateSegment == taskSeg.Segment {
+					seg.compacting = compacting
+				}
+			}
+		}
+	}
+}
+
+func (b *block) compactAndSwapSegments(task compaction.Task) {
+	b.numActiveCompactions.Inc()
+	defer func() {
+		b.numActiveCompactions.Dec()
+	}()
+
+	start := b.nowFn()
+	// create slice of segments to compact
+	maxCompactionNumber := int64(0)
+	segmentsToCompact := make([]segment.Segment, 0, len(task.Segments))
+	for _, s := range task.Segments {
+		segmentsToCompact = append(segmentsToCompact, s.Segment)
+		if s.CompactionNumber > maxCompactionNumber {
+			maxCompactionNumber = s.CompactionNumber
+		}
+	}
+
+	// TODO(prateek): we only log in failure cases right now, this leaves the segments we failed
+	// to compact as "compacting" and would never be compacted again. Change this to do the following:
+	// (1) Retry failed compactions
+	// (2) Emit metrics and logs for cause of failed compactions
+
+	// merge segments into single mutable segment
 	postingsOffset := postings.ID(b.segmentID.Inc())
 	mergedMutableSegment := mem.NewSegment(postingsOffset, b.opts.MemSegmentOptions())
-	if err := mem.Merge(mergedMutableSegment, segmentsToRotate...); err != nil {
-		// TODO(prateek): only log for now, maybe we should add retries?
+	if err := mem.Merge(mergedMutableSegment, segmentsToCompact...); err != nil {
 		b.opts.InstrumentOptions().Logger().Errorf("unable to merge simple segments, err = %v", err)
 		return
 	}
-	mergeTime := time.Since(start)
+
 	if _, err := mergedMutableSegment.Seal(); err != nil {
-		// TODO(prateek): only log for now, maybe we should add retries?
 		b.opts.InstrumentOptions().Logger().Errorf("unable to seal merged segment, err = %v", err)
 		return
 	}
@@ -638,43 +660,75 @@ func (b *block) rotateMutableActiveSegments() {
 		b.opts.InstrumentOptions().Logger().Errorf("unable to fst-ify merged segment, err = %v", err)
 		return
 	}
-	compactionTime := time.Since(start)
-	b.opts.InstrumentOptions().Logger().Infof("took [%v to compact, %v to merge] %d segments of total size %d",
-		compactionTime, mergeTime, len(segmentsToRotate), fstSegment.Size())
 
+	compactionTime := b.nowFn().Sub(start)
+	b.metrics.CompactionLatency.Record(compactionTime)
 	mergedMutableSegment.Close() // can skip error checking here as we've got the equivalent FST
-	newActiveSegment := &activeSegment{
-		creationTime: b.opts.ClockOptions().NowFn()(),
-		state:        fstActiveSegmentState,
-		fstSegment:   fstSegment,
-	}
+	newActiveSegment := newFSTActiveSegment(b.nowFn(), fstSegment, int(1+maxCompactionNumber))
 
 	// swap the successfully converted activeSegments with the newly created FST
 	b.Lock()
-	segments := make([]*activeSegment, 0, len(b.activeSegments))
-	for _, seg := range b.activeSegments {
+	mutableSegmentTimes := make([]time.Time, 0, 10)
+	compactedActiveSegments := make([]*activeSegment, 0, len(segmentsToCompact))
+	newActiveSegments := make([]*activeSegment, 0, len(b.activeSegments))
+	for _, activeSeg := range b.activeSegments {
 		// skip all the activeSegments which have been converted above
-		isRotatedSegment := false
-		for _, aseg := range activeSegmentsToRotate {
-			if seg == aseg {
-				isRotatedSegment = true
+		isCompactedSegment := false
+		for _, seg := range segmentsToCompact {
+			if activeSeg.Segment() == seg {
+				isCompactedSegment = true
 				break
 			}
 		}
-		if !isRotatedSegment {
-			// add all other activeSegments
-			segments = append(segments, seg)
+		// add all other activeSegments
+		if !isCompactedSegment {
+			newActiveSegments = append(newActiveSegments, activeSeg)
+			continue
+		}
+
+		// i.e. this is a compacted segment
+		compactedActiveSegments = append(compactedActiveSegments, activeSeg)
+
+		// track earliest enqueued time for mutable segments to report e2e latency
+		if activeSeg.segmentType == segments.MutableType {
+			mutableSegmentTimes = append(mutableSegmentTimes, activeSeg.earliestWrite)
 		}
 	}
 	// finally, add the newly created activeSegment and update active segments
-	segments = append(segments, newActiveSegment)
-	b.activeSegments = segments
+	newActiveSegments = append(newActiveSegments, newActiveSegment)
+	b.activeSegments = newActiveSegments
 	b.Unlock()
 
-	// release resources from all merged segments
-	for _, seg := range segmentsToRotate {
-		seg.Close() // can skip error checking here as we've got the equivalent FST
+	// report e2e latency for any mutable segments that are finally available now
+	newSegmentAvailableTime := b.nowFn()
+	for _, t := range mutableSegmentTimes {
+		b.metrics.InsertEndToEndLatency.Record(newSegmentAvailableTime.Sub(t))
 	}
+
+	// release resources from all compacted segments
+	for _, seg := range compactedActiveSegments {
+		// can skip error checking here as we've got the equivalent compacted segment
+		seg.Seal()
+		seg.Close()
+	}
+}
+
+func (b *block) newCompactionCandidatesWithRLock() []compaction.Segment {
+	now := b.nowFn()
+	candidates := make([]compaction.Segment, 0, len(b.activeSegments))
+	for _, seg := range b.activeSegments {
+		if seg.compacting || seg.writable {
+			continue
+		}
+		candidates = append(candidates, compaction.Segment{
+			CompactionNumber: int64(seg.compactionNumber),
+			Size:             seg.Size(),
+			Type:             seg.segmentType,
+			Age:              now.Sub(seg.creationTime),
+			Segment:          seg.Segment(),
+		})
+	}
+	return candidates
 }
 
 func (b *block) addActiveSegmentWithLock() {
@@ -684,75 +738,66 @@ func (b *block) addActiveSegmentWithLock() {
 	// move the new mutable segment to the front to make it easier for writes
 	// to find a mutable segment.
 	b.activeSegments = append([]*activeSegment{
-		&activeSegment{
-			creationTime:   b.opts.ClockOptions().NowFn()(),
-			state:          mutableActiveSegmentState,
-			mutableSegment: mutableSeg,
-		},
-	}, b.activeSegments...)
-
-	logger := b.opts.InstrumentOptions().Logger()
-	logger.Infof("[blockStart: %v] stats after adding active segment", b.StartTime())
-	for i, seg := range b.activeSegments {
-		logger.Infof("%d) state [%v] size [%d]", i, seg.state.String(), seg.Size())
-	}
+		newMutableActiveSegment(b.nowFn(), mutableSeg)}, b.activeSegments...)
 }
 
 // mutableActiveSegmentWithRLock returns any activeSegment marked as a mutableSegment.
 // NB: it can return nil if no such segment exists.
 func (b *block) mutableActiveSegmentWithRLock() *activeSegment {
 	for _, seg := range b.activeSegments {
-		if seg.state == mutableActiveSegmentState {
+		if seg.segmentType == segments.MutableType && seg.writable {
 			return seg
 		}
 	}
 	return nil
 }
 
-func (b *block) reportMetrics() {
-	reportInterval := b.opts.InstrumentOptions().ReportInterval()
-	for {
-		select {
-		case <-b.closeCtx.Done():
-			return
-		default:
-			b.RLock()
-			numDocs := float64(0)
-			numSegments := float64(0)
-			numSegmentsCompacting := float64(0)
-			for _, seg := range b.activeSegments {
-				numDocs += float64(seg.Size())
-				numSegments++
-				// if seg.compacting {
-				// 	numSegmentsCompacting++
-				// }
-				b.metrics.segmentSizeHistogram.RecordValue(float64(seg.Size()))
-			}
-			b.RUnlock()
-			b.metrics.numDocs.Update(numDocs)
-			b.metrics.numSegments.Update(numSegments)
-			b.metrics.numSegmentsCompacting.Update(numSegmentsCompacting)
+func (b *block) Stats() BlockStats {
+	b.RLock()
+
+	// active segments
+	active := ActiveSegmentsStats{
+		NumActiveCompactions: b.numActiveCompactions.Load(),
+	}
+	for _, seg := range b.activeSegments {
+		active.NumDocs += seg.Size()
+		active.NumSegments++
+		if seg.compacting {
+			active.NumSegmentsCompacting++
 		}
-		time.Sleep(reportInterval)
+		if seg.segmentType == segments.FSTType {
+			active.NumFSTSegments++
+		} else {
+			active.NumMutableSegments++
+		}
+	}
+
+	// all other segments
+	shard := ShardRangeSegmentsStats{}
+	for _, group := range b.shardRangesSegments {
+		for _, seg := range group.segments {
+			shard.NumSegments++
+			shard.NumDocs += seg.Size()
+		}
+	}
+	b.RUnlock()
+
+	return BlockStats{
+		Active: active,
+		Shard:  shard,
 	}
 }
 
 type blockMetrics struct {
-	numSegmentsCompacting tally.Gauge
-	numSegments           tally.Gauge
-	numDocs               tally.Gauge
-	segmentSizeHistogram  tally.Histogram
-	compactionLatency     tally.Timer
+	CompactionLatency     tally.Timer
+	InsertEndToEndLatency tally.Timer
 }
 
-func newBlockMetrics(scope tally.Scope) blockMetrics {
-	buckets := tally.MustMakeExponentialValueBuckets(1, 10, 7)
+func newBlockMetrics(iopts instrument.Options) blockMetrics {
+	scope := iopts.MetricsScope()
 	return blockMetrics{
-		numSegmentsCompacting: scope.Gauge("num-segments-compacting"),
-		numSegments:           scope.Gauge("num-segments"),
-		numDocs:               scope.Gauge("num-docs"),
-		segmentSizeHistogram:  scope.Histogram("segment-size", buckets),
-		compactionLatency:     scope.Timer("compaction-latency"),
+		CompactionLatency:     scope.Timer("compaction-latency"),
+		InsertEndToEndLatency: scope.Timer("insert-end-to-end-latency"),
 	}
 }
 
@@ -785,6 +830,28 @@ func (b *block) openBlockHasNilActiveSegmentInvariantErrorWithRLock() error {
 	err := fmt.Errorf("internal error: block has open block state [%v] has no mutable active segment", b.state)
 	instrument.EmitInvariantViolationAndGetLogger(b.opts.InstrumentOptions()).Errorf(err.Error())
 	return err
+}
+
+// blockShardsSegments is a collection of segments that has a mapping of what shards
+// and time ranges they completely cover, this can only ever come from computing
+// from data that has come from shards, either on an index flush or a bootstrap.
+type blockShardRangesSegments struct {
+	readsWg         sync.WaitGroup
+	shardTimeRanges result.ShardTimeRanges
+	segments        []segment.Segment
+	sealed          bool
+}
+
+func (b *blockShardRangesSegments) Close() {
+	b.sealed = true
+	go func() {
+		b.readsWg.Wait()
+		for _, seg := range b.segments {
+			if err := seg.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "error closing segment: %v\n", err)
+			}
+		}
+	}()
 }
 
 type closable interface {
