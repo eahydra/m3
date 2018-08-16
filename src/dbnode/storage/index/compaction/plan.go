@@ -131,6 +131,12 @@ func NewPlan(candidateSegments []Segment, opts PlannerOptions) (*Plan, error) {
 			accumulatedSize int64
 		)
 		sort.Slice(bucketSegments, func(i, j int) bool {
+			// i.e. order to prefer mutable segments first, and then smaller segments
+			iMutable := bucketSegments[i].Type == segments.MutableType
+			jMutable := bucketSegments[j].Type == segments.MutableType
+			if iMutable != jMutable {
+				return iMutable
+			}
 			return bucketSegments[i].Size < bucketSegments[j].Size
 		})
 		for _, seg := range bucketSegments {
